@@ -1,19 +1,26 @@
 #!/bin/bash
 # ==============================================================================
-# Project: CF-WARP-Tailscale-microsocks Tunnel Stack Installer (自动化版)
+# Project: CF-WARP-Tailscale-microsocks Tunnel Stack Installer (幂等检查版)
 # Author: Self-host
 # License: MIT
 # Description: One-click installer for Cloudflare WARP Connector + Tailscale + microsocks SOCKS5
 # Target OS: Debian 12 Bookworm amd64
 #
+# 设计原则（幂等）：
+#   - 每项组件先检查，已安装/已配置则跳过，不做重复安装
+#   - 基础依赖逐个核对 dpkg 状态，只装缺失项，全齐则连 apt update 都不跑
+#   - WARP / Tailscale 已装则跳过安装步骤
+#   - microsocks 二进制已编译则跳过 clone+make
+#   - DNS 已含 8.8.8.8 则跳过重写
+#   - .bashrc 别名去重，反复运行不会重复追加
+#
 # 自动化说明：
-#   - 全程无需一步步回车，自动执行到结束
+#   - 全程无需一步步回车
 #   - WARP Token 读取优先级：
 #       1) 环境变量 WARP_TOKEN=xxx
-#       2) 配置文件 /root/.warp-token（文件内只写 token 一行）
-#       3) 交互式输入（脚本会先展示获取流程指引）
-#   - 注册前自动清理旧注册（warp-cli registration delete），
-#     避免报错 "Old registration is still around"
+#       2) 配置文件 /root/.warp-token
+#       3) 交互式输入（先展示获取流程指引）
+#   - 注册前自动清理旧注册，避免 "Old registration is still around"
 # ==============================================================================
 set -eo pipefail
 
@@ -42,27 +49,47 @@ if [ "${OS_VER}" != "12" ]; then
 fi
 
 # ====================== 步骤1：DNS ======================
-info "步骤 1/7：配置DNS（适配泰国阿里云VPS，解决UDP53污染解析失败）"
-rm -f /etc/resolv.conf
-cat > /etc/resolv.conf <<'DNSCONF'
+info "步骤 1/7：检查 DNS 配置"
+if grep -qs "nameserver 8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+    success "DNS 已配置（含 8.8.8.8），跳过"
+else
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf <<'DNSCONF'
 nameserver 8.8.8.8
 nameserver 223.5.5.5
 options timeout:2 attempts:2
 DNSCONF
-success "DNS写入完成：8.8.8.8 / 223.5.5.5"
+    success "DNS写入完成：8.8.8.8 / 223.5.5.5"
+fi
 
 # ====================== 步骤2：基础依赖 ======================
-info "步骤 2/7：更新源 & 安装基础依赖包"
-apt update -y
-apt install -y curl wget git build-essential
-success "基础依赖安装完成"
+info "步骤 2/7：检查基础依赖（缺失才安装）"
+MISSING_PKGS=()
+for pkg in curl wget git build-essential; do
+    if ! dpkg -s "$pkg" >/dev/null 2>&1; then
+        MISSING_PKGS+=("$pkg")
+    fi
+done
+if [ ${#MISSING_PKGS[@]} -gt 0 ]; then
+    info "缺失依赖: ${MISSING_PKGS[*]}，执行安装"
+    apt update -y
+    apt install -y "${MISSING_PKGS[@]}"
+    success "依赖安装完成"
+else
+    success "基础依赖齐全（curl/wget/git/build-essential），跳过安装"
+fi
 
 # ====================== 步骤3：WARP ======================
-info "步骤 3/7：安装 Cloudflare WARP Connector"
-curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" | tee /etc/apt/sources.list.d/cloudflare-client.list
-apt update -y
-apt install -y cloudflare-warp
+info "步骤 3/7：检查/安装 Cloudflare WARP Connector"
+if dpkg -s cloudflare-warp >/dev/null 2>&1; then
+    success "WARP 已安装，跳过安装步骤"
+else
+    curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | gpg --yes --dearmor -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ bookworm main" | tee /etc/apt/sources.list.d/cloudflare-client.list
+    apt update -y
+    apt install -y cloudflare-warp
+    success "WARP 安装完成"
+fi
 
 # 确保 warp-svc 服务就绪
 systemctl start warp-svc 2>/dev/null || true
@@ -89,6 +116,7 @@ WARPTOKEN_TIP
     read -r -p "粘贴你的 WARP Token（留空则跳过注册，稍后可手动执行 warp-cli connector new）: " WARP_TOKEN
 fi
 
+# 已注册且 token 相同时跳过重复注册
 if [ -n "${WARP_TOKEN}" ]; then
     info "清理旧注册（避免 Old registration is still around）..."
     warp-cli disconnect 2>/dev/null || true
@@ -102,9 +130,13 @@ else
 fi
 
 # ====================== 步骤4：Tailscale ======================
-info "步骤 4/7：安装 Tailscale"
-curl -fsSL https://tailscale.com/install.sh | sh
-success "Tailscale 安装完成"
+info "步骤 4/7：检查/安装 Tailscale"
+if dpkg -s tailscale >/dev/null 2>&1; then
+    success "Tailscale 已安装，跳过安装步骤"
+else
+    curl -fsSL https://tailscale.com/install.sh | sh
+    success "Tailscale 安装完成"
+fi
 cat <<'TS_TIP'
 ----------------------------------------
 【Tailscale 入网授权】
@@ -115,16 +147,22 @@ tailscale up
 TS_TIP
 
 # ====================== 步骤5：microsocks ======================
-info "步骤 5/7：编译部署 microsocks SOCKS5 (0.0.0.0:1080)"
-mkdir -p /opt
-cd /opt
-rm -rf microsocks
-git clone https://github.com/rofl0r/microsocks.git
-cd microsocks
-make
+info "步骤 5/7：检查/部署 microsocks SOCKS5 (0.0.0.0:1080)"
+if [ -x /opt/microsocks/microsocks ]; then
+    success "microsocks 二进制已存在，跳过 clone+编译"
+else
+    mkdir -p /opt
+    cd /opt
+    rm -rf microsocks
+    git clone https://github.com/rofl0r/microsocks.git
+    cd microsocks
+    make
+    success "microsocks 编译完成"
+fi
 
-# 写入systemd服务
-cat > /etc/systemd/system/microsocks.service <<'SVC'
+# systemd服务文件：不存在才写入
+if [ ! -f /etc/systemd/system/microsocks.service ]; then
+    cat > /etc/systemd/system/microsocks.service <<'SVC'
 [Unit]
 Description=microsocks socks5 proxy for CF & Tailscale tunnel
 After=network.target
@@ -138,9 +176,11 @@ RestartSec=2
 [Install]
 WantedBy=multi-user.target
 SVC
-systemctl daemon-reload
+    systemctl daemon-reload
+    info "microsocks.service 已写入"
+fi
 systemctl enable --now microsocks
-ss -tulnp | grep 1080
+ss -tulnp | grep 1080 || true
 success "microsocks 已启动，监听 0.0.0.0:1080"
 
 # ====================== 步骤6：保活脚本 ======================
@@ -239,18 +279,23 @@ esac
 SWITCH_SCRIPT
 chmod +x /usr/local/bin/tun-switch
 
-# 获取menu绝对路径，设置 menu 别名
+# 别名去重：先清掉旧的同类别名行，再统一写入，反复运行不会重复追加
+TOUCH_BASHRC="${HOME}/.bashrc"
+if [ -f "${TOUCH_BASHRC}" ]; then
+    grep -vE "alias (CFON|TSON|STATUS|STOPALL|menu)=" "${TOUCH_BASHRC}" > /tmp/.bashrc.tmp 2>/dev/null || true
+    cat /tmp/.bashrc.tmp > "${TOUCH_BASHRC}"
+    rm -f /tmp/.bashrc.tmp
+fi
 MENU_ABS_PATH=$(readlink -f ./menu.sh)
-# 写入别名到bashrc
-echo "alias CFON='tun-switch CFON'" >> ~/.bashrc
-echo "alias TSON='tun-switch TSON'" >> ~/.bashrc
-echo "alias STATUS='tun-switch STATUS'" >> ~/.bashrc
-echo "alias STOPALL='tun-switch STOPALL'" >> ~/.bashrc
-echo "alias menu='bash ${MENU_ABS_PATH}'" >> ~/.bashrc
+echo "alias CFON='tun-switch CFON'" >> "${TOUCH_BASHRC}"
+echo "alias TSON='tun-switch TSON'" >> "${TOUCH_BASHRC}"
+echo "alias STATUS='tun-switch STATUS'" >> "${TOUCH_BASHRC}"
+echo "alias STOPALL='tun-switch STOPALL'" >> "${TOUCH_BASHRC}"
+echo "alias menu='bash ${MENU_ABS_PATH}'" >> "${TOUCH_BASHRC}"
 # 加载别名
-source ~/.bashrc
+source "${TOUCH_BASHRC}" 2>/dev/null || true
 
-success "主控脚本和别名部署完毕"
+success "主控脚本和别名部署完毕（别名已去重）"
 
 # ====================== 完成 ======================
 clear
